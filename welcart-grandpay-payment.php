@@ -54,7 +54,7 @@ class WelcartGrandpayPayment {
     }
 
     private function __construct() {
-        add_action('plugins_loaded', array($this, 'init'), 20);
+        add_action('plugins_loaded', array($this, 'init'), 999);
         register_activation_hook(__FILE__, array($this, 'on_activation'));
         register_deactivation_hook(__FILE__, array($this, 'on_deactivation'));
     }

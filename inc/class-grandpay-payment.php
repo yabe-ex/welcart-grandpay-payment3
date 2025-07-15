@@ -108,6 +108,37 @@ class WelcartGrandpayPaymentProcessor {
 
         error_log('GrandPay Payment: Order data prepared: ' . print_r($order_data, true));
 
+        // ★★★ ここに usces_reg_orderdata() の呼び出しを追加します ★★★
+        // usces_reg_orderdata は $_SESSION['usces_cart'] と $_SESSION['usces_entry'] に依存します。
+        // このタイミングでWelcartの注文情報を wp_usces_order テーブルに登録します。
+        $welcart_order_db_id = usces_reg_orderdata(
+            array(
+                'acting' => 'grandpay', // 決済代行コード
+                'order_date' => current_time('mysql'), // 注文日時
+                'payment_name' => $order_data['payment_name'] ?? 'GrandPay', // 決済方法名
+                // その他の acting_results に関連する情報があれば追加
+            )
+        );
+
+        if (false === $welcart_order_db_id) {
+            // ログとエラーメッセージを改善
+            error_log('GrandPay Payment: Failed to register order data in wp_usces_order table via usces_reg_orderdata(). Welcart DB error.');
+            $usces->error_message = 'Welcartへの注文情報初期登録に失敗しました。';
+            $this->redirect_to_cart_with_error($usces->error_message);
+            return;
+        } else {
+            error_log('GrandPay Payment: Order data successfully registered in wp_usces_order table. Welcart DB Order ID: ' . $welcart_order_db_id);
+            // update_post_meta($order_data['order_id'], '_grandpay_welcart_db_order_id', $welcart_order_db_id);
+
+            $transient_key = 'grandpay_welcart_db_order_id_';
+            set_transient($transient_key, $welcart_order_db_id, HOUR_IN_SECONDS); // HOUR_IN_SECONDS は WordPress 定数
+
+        }
+
+
+
+        // ★★★ usces_reg_orderdata() の呼び出しここまで ★★★
+
         // チェックアウトセッション作成
         $result = $this->api->create_checkout_session($order_data);
 
@@ -314,6 +345,10 @@ class WelcartGrandpayPaymentProcessor {
             error_log('GrandPay Payment: Success URL: ' . $success_url);
             error_log('GrandPay Payment: Failure URL: ' . $failure_url);
             error_log('GrandPay Payment: Callback nonce: ' . $callback_nonce);
+
+            error_log('GrandPay Payment: Debug - Initial $complete_url value: ' . $complete_url);
+            error_log('GrandPay Payment: Debug - Final $success_url generated: ' . $success_url);
+
 
             $order_data = array(
                 'order_id' => $order_id,
@@ -598,6 +633,8 @@ class WelcartGrandpayPaymentProcessor {
      * 決済完了後のコールバック処理（詳細デバッグ版 + 強化検索）
      */
     public function handle_payment_callback() {
+        ob_start();
+
         // 🔧 重複実行防止フラグ
         static $callback_processed = false;
         if ($callback_processed) {
@@ -804,6 +841,7 @@ class WelcartGrandpayPaymentProcessor {
         $redirect_url = add_query_arg('order_id', $order_id, $complete_url);
 
         error_log('GrandPay Payment: Redirecting to complete page: ' . $redirect_url);
+        ob_end_clean();
         wp_redirect($redirect_url);
         exit;
     }
@@ -979,95 +1017,79 @@ class WelcartGrandpayPaymentProcessor {
     /**
      * 注文完了処理（修正版 - Welcart連携強化）
      */
-    private function complete_order($order_id, $payment_data) {
-        global $usces;
+    private function complete_order($order_id, $payment_data) { // $order_id は wp_posts のIDです
+        global $usces, $wpdb;
 
         error_log('GrandPay Payment: Starting complete_order for order_id: ' . $order_id);
         error_log('GrandPay Payment: Payment data: ' . print_r($payment_data, true));
 
         try {
-            // 🔧 修正: 重複処理防止
+            // 🔧 重複処理防止
             $current_status = get_post_meta($order_id, '_grandpay_payment_status', true);
             if ($current_status === 'completed') {
                 error_log('GrandPay Payment: Order already completed: ' . $order_id);
                 return;
             }
 
-            // 🔧 修正: Welcartの正しい注文ステータス更新方法
-
             // 1. Welcart標準の注文ステータス更新
-            if (function_exists('usces_change_order_status')) {
-                $status_result = usces_change_order_status($order_id, 'ordercompletion');
-                error_log('GrandPay Payment: usces_change_order_status result: ' . print_r($status_result, true));
-            } else {
-                // フォールバック: 直接更新
-                error_log('GrandPay Payment: usces_change_order_status not found, using fallback');
-                update_post_meta($order_id, '_order_status', 'ordercompletion');
-            }
+            update_post_meta($order_id, '_order_status', 'ordercompletion'); // _order_statusメタを更新
 
-            // 2. 注文投稿タイプのステータス更新
+            // wp_posts.post_status を 'publish' に更新（Welcartの成功時のデフォルト）
             $order_post = array(
                 'ID' => $order_id,
-                'post_status' => 'publish'  // Welcartの完了済み注文ステータス
+                'post_status' => 'publish' // Welcartの成功時またはデフォルトの公開状態
             );
-            $update_result = wp_update_post($order_post);
+            $update_post_result = wp_update_post($order_post);
 
-            if (is_wp_error($update_result)) {
-                error_log('GrandPay Payment: Failed to update post status: ' . $update_result->get_error_message());
+            if (is_wp_error($update_post_result) || $update_post_result === 0) {
+                error_log('GrandPay Payment: FAILED to update wp_posts.post_status for order ' . $order_id . ': ' . (is_wp_error($update_post_result) ? $update_post_result->get_error_message() : 'Unknown error'));
             } else {
-                error_log('GrandPay Payment: Post status updated successfully');
+                error_log('GrandPay Payment: SUCCESSFULLY updated wp_posts.post_status to "' . $order_post['post_status'] . '" for order ' . $order_id);
             }
 
-            // 3. 決済情報を保存
+            // ★★★ ここから修正/最終版 ★★★
+            // _grandpay_welcart_db_order_id メタから wp_usces_order のIDを取得
+            // $welcart_db_order_id = get_post_meta($order_id, '_grandpay_welcart_db_order_id', true);
+
+            $transient_key = 'grandpay_welcart_db_order_id_';
+            $welcart_db_order_id = get_transient($transient_key);
+
+            if (empty($welcart_db_order_id)) {
+                // _grandpay_welcart_db_order_id が見つからない場合は、正しい wp_usces_order.ID を特定できないため、更新をスキップします。
+                error_log('GrandPay Payment: CRITICAL ERROR - _grandpay_welcart_db_order_id meta not found for wp_posts ID: ' . $order_id . '. Cannot update wp_usces_order table.');
+                return;
+            }
+
+            $target_db_order_id = $welcart_db_order_id;
+            error_log('GrandPay Payment: Retrieved wp_usces_order DB ID from meta: ' . $target_db_order_id . ' for wp_posts ID: ' . $order_id);
+
+            // wp_usces_order テーブルの order_status フィールドを更新
+            $order_table_name = $wpdb->prefix . 'usces_order';
+            $update_result_db_order = $wpdb->update(
+                $order_table_name,
+                array('order_status' => 'ordercompletion'), // 成功時のWelcart内部ステータス
+                array('ID' => $target_db_order_id) // 正しく取得した wp_usces_order テーブルのIDを使用
+            );
+
+            if (false === $update_result_db_order) {
+                error_log('GrandPay Payment: FAILED to update wp_usces_order status for DB ID ' . $target_db_order_id . ': ' . $wpdb->last_error);
+            } else {
+                error_log('GrandPay Payment: SUCCESSFULLY updated wp_usces_order status to "ordercompletion" for DB ID ' . $target_db_order_id);
+            }
+            // ★★★ ここまで修正/最終版 ★★★
+
+            // 2. 決済情報を更新
             update_post_meta($order_id, '_grandpay_payment_status', 'completed');
-            update_post_meta($order_id, '_grandpay_transaction_id', $payment_data['id'] ?? '');
             update_post_meta($order_id, '_grandpay_completed_at', current_time('mysql'));
-            update_post_meta($order_id, '_grandpay_payment_data', $payment_data);
+            update_post_meta($order_id, '_acting_return', 'success');
+            update_post_meta($order_id, '_grandpay_payment_id', $payment_data['id']); // 決済IDを保存
 
-            // 🔧 修正: Welcart標準の決済情報更新
-            if (isset($payment_data['id'])) {
-                update_post_meta($order_id, '_wc_trans_id', $payment_data['id']); // Welcart標準フィールド
-            }
+            error_log('GrandPay Payment: Order completed - ID: ' . $order_id . ', Payment ID: ' . $payment_data['id']);
 
-            // 決済方法情報
-            update_post_meta($order_id, '_payment_method', 'grandpay');
-            update_post_meta($order_id, '_acting_return', 'completion');
-
-            // 4. 🔧 カートクリア部分を一時的に無効化（エラー回避）
-            error_log('GrandPay Payment: Skipping cart clear to avoid method errors');
-            /*
-            // TODO: 正しいWelcartカートクリア方法を調査後に実装
-            if (isset($usces->cart)) {
-                error_log('GrandPay Payment: Clearing cart');
-                $usces->cart->empty_cart();
-            }
-            */
-
-            // セッションの注文情報をクリア
-            if (isset($_SESSION['usces_entry'])) {
-                unset($_SESSION['usces_entry']);
-                error_log('GrandPay Payment: Cleared usces_entry session');
-            }
-
-            // 5. 🔧 新規追加: 在庫管理処理
-            $this->process_inventory_update($order_id);
-
-            // 6. 🔧 新規追加: メール通知処理
-            $this->send_completion_notifications($order_id);
-
-            error_log('GrandPay Payment: Order completed successfully - ID: ' . $order_id);
-
-            // 7. 完了フックを実行
+            // 3. 成功フックを実行
             do_action('grandpay_payment_completed', $order_id, $payment_data);
-            do_action('usces_action_order_completion', $order_id); // Welcart標準フック
-
         } catch (Exception $e) {
             error_log('GrandPay Payment: Exception in complete_order: ' . $e->getMessage());
-            error_log('GrandPay Payment: Exception trace: ' . $e->getTraceAsString());
-
-            // エラー時は失敗状態に設定
-            $this->fail_order($order_id);
-            throw $e;
         }
     }
 
@@ -1126,27 +1148,56 @@ class WelcartGrandpayPaymentProcessor {
     /**
      * 注文失敗処理（修正版 - エラーハンドリング強化）
      */
-    private function fail_order($order_id) {
-        global $usces;
+    private function fail_order($order_id) { // $order_id は wp_posts のIDです
+        global $usces, $wpdb;
 
         error_log('GrandPay Payment: Starting fail_order for order_id: ' . $order_id);
 
         try {
-            // 🔧 修正: 重複処理防止
+            // 🔧 重複処理防止
             $current_status = get_post_meta($order_id, '_grandpay_payment_status', true);
             if ($current_status === 'failed') {
                 error_log('GrandPay Payment: Order already failed: ' . $order_id);
                 return;
             }
 
-            // 1. Welcart標準の注文ステータス更新
-            if (function_exists('usces_change_order_status')) {
-                $status_result = usces_change_order_status($order_id, 'cancel');
-                error_log('GrandPay Payment: Order status changed to cancel: ' . print_r($status_result, true));
-            } else {
-                // フォールバック
-                update_post_meta($order_id, '_order_status', 'cancel');
+            // 1. wp_posts のメタデータを更新
+            update_post_meta($order_id, '_order_status', 'cancel'); // Welcartの内部ステータス 'cancel' を設定
+
+            // wp_posts.post_status は Welcartの仕様により 'publish' のままであるため、ここでは更新しません。
+
+            // ★★★ ここから修正/最終版 ★★★
+            // _grandpay_welcart_db_order_id メタから wp_usces_order のIDを取得
+            // $welcart_db_order_id = get_post_meta($order_id, '_grandpay_welcart_db_order_id', true);
+            $transient_key = 'grandpay_welcart_db_order_id_';
+            $welcart_db_order_id = get_transient($transient_key);
+
+
+            if (empty($welcart_db_order_id)) {
+                // _grandpay_welcart_db_order_id が見つからない場合は、正しい wp_usces_order.ID を特定できないため、更新をスキップします。
+                // このエラーが発生する場合、初期登録時にメタデータの保存ができていないか、
+                // 異なる wp_posts.ID が渡されている可能性があります。
+                error_log('GrandPay Payment: CRITICAL ERROR - _grandpay_welcart_db_order_id meta not found for wp_posts ID: ' . $order_id . '. Cannot update wp_usces_order table.');
+                return;
             }
+
+            $target_db_order_id = $welcart_db_order_id;
+            error_log('GrandPay Payment: Retrieved wp_usces_order DB ID from meta: ' . $target_db_order_id . ' for wp_posts ID: ' . $order_id);
+
+            // wp_usces_order テーブルの order_status フィールドを更新
+            $order_table_name = $wpdb->prefix . 'usces_order';
+            $update_result_db_order = $wpdb->update(
+                $order_table_name,
+                array('order_status' => 'cancel'),
+                array('ID' => $target_db_order_id) // 正しく取得した wp_usces_order テーブルのIDを使用
+            );
+
+            if (false === $update_result_db_order) {
+                error_log('GrandPay Payment: FAILED to update wp_usces_order status for DB ID ' . $target_db_order_id . ': ' . $wpdb->last_error);
+            } else {
+                error_log('GrandPay Payment: SUCCESSFULLY updated wp_usces_order status to "cancel" for DB ID ' . $target_db_order_id);
+            }
+            // ★★★ ここまで修正/最終版 ★★★
 
             // 2. 決済情報を更新
             update_post_meta($order_id, '_grandpay_payment_status', 'failed');
